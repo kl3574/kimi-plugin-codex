@@ -4,19 +4,20 @@ A Kimi Code plugin that delegates read-only code review to the local OpenAI Code
 
 ## Install
 
-From a local path:
-
-```text
-/plugins install /home/lkx/kimi-plugin-codex
-/reload
-```
-
-From GitHub:
+From GitHub (recommended):
 
 ```text
 /plugins install https://github.com/kl3574/kimi-plugin-codex
 /reload
 ```
+
+Or clone manually into your Kimi Code plugins directory:
+
+```bash
+git clone https://github.com/kl3574/kimi-plugin-codex.git ~/.kimi-code/plugins/managed/kimi-plugin-codex
+```
+
+Then restart Kimi Code or run `/reload`.
 
 ## Usage
 
@@ -62,5 +63,5 @@ The plugin wraps `codex review --uncommitted` / `codex review --base <branch>` a
   - `--scope auto|working-tree|branch` target selection
   - `rescue`, `transfer`, `status`, `result`, or `cancel` commands
   - Stop-time review gate hook
-- Skills and commands reference the helper script by absolute path `/home/lkx/.kimi-code/plugins/managed/kimi-plugin-codex/scripts/codex-review.mjs`.
+- Skills and commands reference the helper script relative to the plugin root. If you move the plugin directory, reinstall it so the paths resolve correctly.
 - This is a v0.1 local prototype.
