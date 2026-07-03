@@ -1,0 +1,13 @@
+{
+  "name": "kimi-plugin-codex",
+  "version": "0.1.0",
+  "description": "Read-only Codex CLI code review from inside Kimi Code",
+  "keywords": ["codex", "code-review", "review"],
+  "skills": "./skills/",
+  "commands": "./commands/",
+  "interface": {
+    "displayName": "Kimi Plugin Codex",
+    "shortDescription": "Codex CLI review inside Kimi Code",
+    "developerName": "Local"
+  }
+}
