@@ -17,16 +17,35 @@ function runSync(cmd, args, opts = {}) {
 
 function runWithStdin(cmd, args, stdin, opts = {}) {
   return new Promise((resolve, reject) => {
+    const { timeout = 5 * 60 * 1000, maxBuffer = DIFF_MAX_BUFFER, ...spawnOpts } = opts;
     const child = spawn(cmd, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      ...opts,
+      timeout,
+      ...spawnOpts,
     });
     let stdout = '';
     let stderr = '';
-    child.stdout.on('data', (data) => { stdout += data.toString(); });
-    child.stderr.on('data', (data) => { stderr += data.toString(); });
+    let killed = false;
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+      if (Buffer.byteLength(stdout, 'utf8') > maxBuffer && !killed) {
+        killed = true;
+        child.kill('SIGTERM');
+      }
+    });
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+      if (Buffer.byteLength(stderr, 'utf8') > maxBuffer && !killed) {
+        killed = true;
+        child.kill('SIGTERM');
+      }
+    });
     child.on('error', reject);
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
+      if (signal === 'SIGTERM' && killed) {
+        resolve({ code: 1, stdout, stderr: stderr + '\n❌ Output exceeded maxBuffer limit.' });
+        return;
+      }
       resolve({ code, stdout, stderr });
     });
     child.stdin.write(stdin);
@@ -50,27 +69,36 @@ function gitStatusPorcelain(cwd) {
 
 function hasChanges(base, cwd) {
   if (base) {
-    const result = runSync('git', ['diff', '--quiet', `${base}...HEAD`], { cwd });
-    if (result.status === 0) return false;
-    if (result.status === 1) return true;
-    throw new Error(`git diff failed: ${result.stderr || result.error?.message || 'unknown error'}`);
+    const branchResult = runSync('git', ['diff', '--quiet', `${base}..HEAD`], { cwd });
+    if (branchResult.status === 0) {
+      // Branch diff is empty; also check working tree so local edits are not ignored.
+      return gitStatusPorcelain(cwd).trim().length > 0;
+    }
+    if (branchResult.status === 1) return true;
+    throw new Error(`git diff failed: ${branchResult.stderr || branchResult.error?.message || 'unknown error'}`);
   }
   return gitStatusPorcelain(cwd).trim().length > 0;
 }
 
+function checkGitDiff(result, label) {
+  if (result.status !== 0) {
+    throw new Error(`git diff (${label}) failed: ${result.stderr || result.error?.message || 'unknown error'}`);
+  }
+}
+
 function getDiff(base, cwd) {
   if (base) {
-    const result = runSync('git', ['diff', '--no-color', `${base}...HEAD`], { cwd, maxBuffer: DIFF_MAX_BUFFER });
-    if (result.status !== 0) {
-      throw new Error(`git diff failed: ${result.stderr || result.error?.message || 'unknown error'}`);
-    }
+    const result = runSync('git', ['diff', '--no-color', `${base}..HEAD`], { cwd, maxBuffer: DIFF_MAX_BUFFER });
+    checkGitDiff(result, 'base');
     return result.stdout;
   }
   // Combine staged and unstaged diffs separately so that working-tree changes
   // that cancel out staged changes do not hide the staged patch.
-  const unstaged = runSync('git', ['diff', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER }).stdout;
-  const staged = runSync('git', ['diff', '--cached', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER }).stdout;
-  return [staged, unstaged].filter(Boolean).join('\n');
+  const unstaged = runSync('git', ['diff', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER });
+  checkGitDiff(unstaged, 'unstaged');
+  const staged = runSync('git', ['diff', '--cached', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER });
+  checkGitDiff(staged, 'staged');
+  return [staged.stdout, unstaged.stdout].filter(Boolean).join('\n');
 }
 
 const MAX_UNTRACKED_BYTES = 1024 * 1024; // 1 MB per untracked file
@@ -129,7 +157,14 @@ function formatUntrackedDiff(cwd) {
 function buildReviewDiff(base, cwd) {
   const trackedDiff = getDiff(base, cwd);
   if (base) {
-    return trackedDiff;
+    // When comparing to a base ref, also include working-tree changes so the
+    // review covers the user's current state, not just committed branch diffs.
+    const unstaged = runSync('git', ['diff', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER });
+    checkGitDiff(unstaged, 'unstaged');
+    const staged = runSync('git', ['diff', '--cached', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER });
+    checkGitDiff(staged, 'staged');
+    const workingDiff = [staged.stdout, unstaged.stdout].filter(Boolean).join('\n');
+    return [trackedDiff, workingDiff].filter(Boolean).join('\n');
   }
   const untrackedDiff = formatUntrackedDiff(cwd);
   if (!untrackedDiff) {
@@ -147,7 +182,11 @@ function splitArgsString(s) {
     let token = '';
     if (s[i] === '"' || s[i] === "'") {
       const quote = s[i++];
-      while (i < s.length && s[i] !== quote) token += s[i++];
+      while (i < s.length && s[i] !== quote) {
+        if (s[i] === '\\' && i + 1 < s.length) token += s[++i];
+        else token += s[i];
+        i++;
+      }
       if (i < s.length) i++;
     } else {
       while (i < s.length && !/\s/.test(s[i])) token += s[i++];
@@ -158,13 +197,8 @@ function splitArgsString(s) {
 }
 
 function normalizeArgv(argv) {
-  let args = argv.slice(2);
-  if (args.length === 1 && args[0].length > 0) {
-    args = splitArgsString(args[0]);
-  } else if (args.length === 1 && args[0].length === 0) {
-    args = [];
-  }
-  return args;
+  const raw = argv.slice(2).join(' ');
+  return raw.length > 0 ? splitArgsString(raw) : [];
 }
 
 function parseArgs(argv) {
@@ -200,8 +234,8 @@ function parseArgs(argv) {
 }
 
 function codexOnPath() {
-  const result = runSync('which', ['codex']);
-  return result.status === 0 && result.stdout.trim().length > 0;
+  const result = runSync('codex', ['--version']);
+  return result.status === 0;
 }
 
 function codexVersion() {
@@ -213,7 +247,7 @@ function codexVersion() {
 function codexAuthOk() {
   const result = runSync('codex', ['login', 'status']);
   const output = (result.stdout || '') + (result.stderr || '');
-  return result.status === 0 && output.includes('Logged in');
+  return result.status === 0 && /\bLogged in\b/.test(output);
 }
 
 function setup() {
@@ -251,7 +285,7 @@ async function review({ base, focus, adversarial = false, unknown = [], position
   }
 
   if (!codexOnPath()) {
-    console.error('❌ Codex CLI not found on PATH. Run `codex-setup` first.');
+    console.error('❌ Codex CLI not found on PATH. Run `/kimi-plugin-codex:setup` first.');
     process.exit(1);
   }
 
@@ -266,40 +300,43 @@ async function review({ base, focus, adversarial = false, unknown = [], position
   }
 
   let diff;
-  let result;
-  if (adversarial) {
-    try {
-      diff = buildReviewDiff(base, gitRoot);
-    } catch (err) {
-      console.error(`❌ ${err.message}`);
-      process.exit(1);
-    }
-
-    const prompt = [
-      'You are a senior staff engineer doing a read-only adversarial code review.',
-      effectiveFocus ? `Focus: ${effectiveFocus}` : '',
-      'Challenge design decisions, trade-offs, hidden assumptions, and failure modes.',
-      'Categorize findings as Critical, Important, or Minor.',
-      'For each finding include severity, file:line, evidence, why it matters, and a recommended fix.',
-      'End with an overall verdict.',
-    ].join('\n');
-
-    result = await runWithStdin('codex', [
-      'exec',
-      '-s', 'read-only',
-      '--ignore-user-config',
-      '--ephemeral',
-      prompt,
-    ], diff, { cwd: gitRoot });
-  } else {
-    const codexArgs = ['review'];
-    if (base) {
-      codexArgs.push('--base', base);
-    } else {
-      codexArgs.push('--uncommitted');
-    }
-    result = runSync('codex', codexArgs, { cwd: gitRoot, maxBuffer: DIFF_MAX_BUFFER });
+  try {
+    diff = buildReviewDiff(base, gitRoot);
+  } catch (err) {
+    console.error(`❌ ${err.message}`);
+    process.exit(1);
   }
+
+  if (!diff.trim()) {
+    console.log('No changes to review.');
+    return;
+  }
+
+  let result;
+  const promptLines = [
+    'You are a senior staff engineer doing a read-only code review.',
+    'Review the git diff provided on stdin. Do not modify any files.',
+  ];
+  if (adversarial) {
+    promptLines.push('Challenge design decisions, trade-offs, hidden assumptions, and failure modes. Be constructive but skeptical.');
+  }
+  if (effectiveFocus) {
+    promptLines.push(`Focus: ${effectiveFocus}`);
+  }
+  promptLines.push(
+    'Categorize findings as Critical, Important, or Minor.',
+    'For each finding include severity, file:line, evidence, why it matters, and a recommended fix.',
+    'End with an overall verdict.',
+  );
+  const prompt = promptLines.join('\n');
+
+  result = await runWithStdin('codex', [
+    'exec',
+    '-s', 'read-only',
+    '--ignore-user-config',
+    '--ephemeral',
+    prompt,
+  ], diff, { cwd: gitRoot, maxBuffer: DIFF_MAX_BUFFER, timeout: 5 * 60 * 1000 });
 
   if ((result.status ?? result.code) !== 0) {
     console.error('❌ Codex review failed.');

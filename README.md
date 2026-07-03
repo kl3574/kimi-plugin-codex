@@ -37,13 +37,13 @@ Use the skill codex-adversarial-review with base main
 
 ## How It Works
 
-The plugin wraps `codex review --uncommitted` / `codex review --base <branch>` and passes an optional adversarial focus as the review prompt. Codex returns its findings directly.
+The plugin builds a git diff (staged + unstaged + untracked files, or against a base ref) and passes it to `codex exec -s read-only --ignore-user-config --ephemeral` with a review prompt. Codex returns its findings directly. A `--focus` string is appended to the prompt in both normal and adversarial modes.
 
 ## Verification
 
 - Plugin manifest: valid JSON, `skills` and `commands` paths present.
 - Helper script: tested with `setup`, `review`, `adversarial-review`, and `--base <ref>`.
-- Normal review uses `codex review --uncommitted` / `--base <ref>`.
+- Normal and adversarial reviews both use `codex exec` with the pre-computed diff and a read-only sandbox.
 - Adversarial review pipes the diff into `codex exec -s read-only --ignore-user-config --ephemeral` with an adversarial prompt.
 - Review is read-only; sandbox is set to `read-only` for `exec` paths.
 - Boundary tests passed:
@@ -57,7 +57,7 @@ The plugin wraps `codex review --uncommitted` / `codex review --base <branch>` a
 
 - Requires a local git repository.
 - Requires `codex` on PATH and authenticated.
-- `codex review` does not accept a custom prompt in this Codex CLI version, so adversarial mode uses `codex exec` instead.
+- `--focus` is supported in normal review mode by appending it to the review prompt.
 - Unlike `codex-plugin-cc`, this v0.1 prototype does **not** implement:
   - `--background` / `--wait` execution modes
   - `--scope auto|working-tree|branch` target selection
