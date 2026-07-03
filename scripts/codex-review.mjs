@@ -59,30 +59,41 @@ function hasChanges(base, cwd) {
 }
 
 function getDiff(base, cwd) {
-  const args = ['diff', '--no-color'];
   if (base) {
-    args.push(`${base}...HEAD`);
-  } else {
-    args.push('HEAD');
+    const result = runSync('git', ['diff', '--no-color', `${base}...HEAD`], { cwd, maxBuffer: DIFF_MAX_BUFFER });
+    if (result.status !== 0) {
+      throw new Error(`git diff failed: ${result.stderr || result.error?.message || 'unknown error'}`);
+    }
+    return result.stdout;
   }
-  const result = runSync('git', args, { cwd, maxBuffer: DIFF_MAX_BUFFER });
-  if (result.status !== 0) {
-    throw new Error(`git diff failed: ${result.stderr || result.error?.message || 'unknown error'}`);
-  }
-  return result.stdout;
+  // Combine staged and unstaged diffs separately so that working-tree changes
+  // that cancel out staged changes do not hide the staged patch.
+  const unstaged = runSync('git', ['diff', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER }).stdout;
+  const staged = runSync('git', ['diff', '--cached', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER }).stdout;
+  return [staged, unstaged].filter(Boolean).join('\n');
 }
 
+const MAX_UNTRACKED_BYTES = 1024 * 1024; // 1 MB per untracked file
+
 function getUntrackedFiles(cwd) {
-  const result = runSync('git', ['ls-files', '--others', '--exclude-standard'], { cwd });
+  const result = runSync('git', ['ls-files', '-z', '--others', '--exclude-standard'], { cwd });
   if (result.status !== 0) return [];
-  return result.stdout.trim().split('\n').filter(Boolean);
+  return result.stdout.split('\0').filter(Boolean);
 }
 
 function readRepoFile(cwd, file) {
+  const fullPath = path.join(cwd, file);
   try {
-    return fs.readFileSync(path.join(cwd, file), 'utf8');
+    const stat = fs.lstatSync(fullPath);
+    if (!stat.isFile()) {
+      return { skipped: true, reason: 'not a regular file' };
+    }
+    if (stat.size > MAX_UNTRACKED_BYTES) {
+      return { skipped: true, reason: 'file too large' };
+    }
+    return { content: fs.readFileSync(fullPath, 'utf8') };
   } catch {
-    return '';
+    return { skipped: true, reason: 'read error' };
   }
 }
 
@@ -90,8 +101,14 @@ function formatUntrackedDiff(cwd) {
   const files = getUntrackedFiles(cwd);
   if (files.length === 0) return '';
   const parts = [];
+  const skipped = [];
   for (const file of files) {
-    const content = readRepoFile(cwd, file);
+    const result = readRepoFile(cwd, file);
+    if (result.skipped) {
+      skipped.push(`${file} (${result.reason})`);
+      continue;
+    }
+    const content = result.content;
     const lines = content.split('\n');
     parts.push(`diff --git a/${file} b/${file}`);
     parts.push('new file mode 100644');
@@ -102,6 +119,9 @@ function formatUntrackedDiff(cwd) {
     for (const line of lines) {
       parts.push(`+${line}`);
     }
+  }
+  if (skipped.length) {
+    parts.push(`\n# Skipped untracked files: ${skipped.join(', ')}`);
   }
   return parts.join('\n');
 }
