@@ -63,5 +63,5 @@ The plugin wraps `codex review --uncommitted` / `codex review --base <branch>` a
   - `--scope auto|working-tree|branch` target selection
   - `rescue`, `transfer`, `status`, `result`, or `cancel` commands
   - Stop-time review gate hook
-- Skills and commands reference the helper script relative to the plugin root. If you move the plugin directory, reinstall it so the paths resolve correctly.
+- Skills and commands resolve the helper script via `PLUGIN_ROOT` using `KIMI_PLUGIN_ROOT`, `KIMI_CODE_HOME`, or the default `~/.kimi-code/plugins/managed/kimi-plugin-codex` path.
 - This is a v0.1 local prototype.

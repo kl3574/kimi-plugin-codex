@@ -138,19 +138,62 @@ function buildReviewDiff(base, cwd) {
   return [trackedDiff, untrackedDiff].filter(Boolean).join('\n');
 }
 
+function splitArgsString(s) {
+  const tokens = [];
+  let i = 0;
+  while (i < s.length) {
+    while (i < s.length && /\s/.test(s[i])) i++;
+    if (i >= s.length) break;
+    let token = '';
+    if (s[i] === '"' || s[i] === "'") {
+      const quote = s[i++];
+      while (i < s.length && s[i] !== quote) token += s[i++];
+      if (i < s.length) i++;
+    } else {
+      while (i < s.length && !/\s/.test(s[i])) token += s[i++];
+    }
+    tokens.push(token);
+  }
+  return tokens;
+}
+
+function normalizeArgv(argv) {
+  let args = argv.slice(2);
+  if (args.length === 1 && args[0].length > 0) {
+    args = splitArgsString(args[0]);
+  } else if (args.length === 1 && args[0].length === 0) {
+    args = [];
+  }
+  return args;
+}
+
 function parseArgs(argv) {
-  const args = argv.slice(2);
+  const args = normalizeArgv(argv);
   const command = args[0];
-  const options = { base: null, focus: '' };
+  const options = { base: null, focus: '', unknown: [], positional: [] };
   for (let i = 1; i < args.length; i++) {
-    if (args[i] === '--base' && i + 1 < args.length) {
+    if (args[i] === '--base') {
+      if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
+        throw new Error('--base requires a value');
+      }
       options.base = args[++i];
-    } else if (args[i] === '--focus' && i + 1 < args.length) {
+    } else if (args[i] === '--focus') {
+      if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
+        throw new Error('--focus requires a value');
+      }
       options.focus = args[++i];
     } else if (args[i].startsWith('--base=')) {
-      options.base = args[i].slice(7);
+      const value = args[i].slice(7);
+      if (!value) throw new Error('--base requires a value');
+      options.base = value;
     } else if (args[i].startsWith('--focus=')) {
-      options.focus = args[i].slice(8);
+      const value = args[i].slice(8);
+      if (!value) throw new Error('--focus requires a value');
+      options.focus = value;
+    } else if (args[i].startsWith('-')) {
+      options.unknown.push(args[i]);
+    } else {
+      options.positional.push(args[i]);
     }
   }
   return { command, options };
@@ -187,7 +230,20 @@ function setup() {
   console.log('✅ Codex CLI is authenticated.');
 }
 
-async function review({ base, focus, adversarial = false }) {
+async function review({ base, focus, adversarial = false, unknown = [], positional = [] }) {
+  if (unknown.length) {
+    console.error(`❌ Unknown option(s): ${unknown.join(', ')}`);
+    process.exit(1);
+  }
+
+  let effectiveFocus = focus;
+  if (adversarial && !effectiveFocus && positional.length) {
+    effectiveFocus = positional.join(' ');
+  } else if (positional.length) {
+    console.error(`❌ Unexpected positional argument(s): ${positional.join(' ')}`);
+    process.exit(1);
+  }
+
   const gitRoot = findGitRoot();
   if (!gitRoot) {
     console.error('❌ Not inside a git repository.');
@@ -221,7 +277,7 @@ async function review({ base, focus, adversarial = false }) {
 
     const prompt = [
       'You are a senior staff engineer doing a read-only adversarial code review.',
-      focus ? `Focus: ${focus}` : '',
+      effectiveFocus ? `Focus: ${effectiveFocus}` : '',
       'Challenge design decisions, trade-offs, hidden assumptions, and failure modes.',
       'Categorize findings as Critical, Important, or Minor.',
       'For each finding include severity, file:line, evidence, why it matters, and a recommended fix.',
