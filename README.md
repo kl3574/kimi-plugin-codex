@@ -45,16 +45,22 @@ The plugin wraps `codex review --uncommitted` / `codex review --base <branch>` a
 - Normal review uses `codex review --uncommitted` / `--base <ref>`.
 - Adversarial review pipes the diff into `codex exec -s read-only --ignore-user-config --ephemeral` with an adversarial prompt.
 - Review is read-only; sandbox is set to `read-only` for `exec` paths.
-- Smoke test in `/tmp/review-test` caught the intentional `add` → `a-b` bug.
 - Boundary tests passed:
   - Non-git directory → clear error, exit 1.
   - Empty diff → "No changes to review.", exit 0.
+  - Staged-only, unstaged-only, and untracked changes → detected and reviewed.
   - Invalid base ref → clear git error, exit 1.
+  - Large diff (~6 MB / 100 k lines) → handled without `maxBuffer` errors.
 
 ## Limitations
 
 - Requires a local git repository.
 - Requires `codex` on PATH and authenticated.
 - `codex review` does not accept a custom prompt in this Codex CLI version, so adversarial mode uses `codex exec` instead.
+- Unlike `codex-plugin-cc`, this v0.1 prototype does **not** implement:
+  - `--background` / `--wait` execution modes
+  - `--scope auto|working-tree|branch` target selection
+  - `rescue`, `transfer`, `status`, `result`, or `cancel` commands
+  - Stop-time review gate hook
 - Skills and commands reference the helper script by absolute path `/home/lkx/.kimi-code/plugins/managed/kimi-plugin-codex/scripts/codex-review.mjs`.
 - This is a v0.1 local prototype.
