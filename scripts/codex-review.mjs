@@ -298,7 +298,12 @@ function gitBlobHash(content) {
 }
 
 function syntheticNewFileDiff(filePath, relPath) {
-  const content = fs.readFileSync(filePath);
+  let content;
+  try {
+    content = fs.readFileSync(filePath);
+  } catch (err) {
+    return { skipped: true, reason: `read error: ${err.message}` };
+  }
   if (isBinaryContent(content)) {
     return { skipped: true, reason: 'binary file' };
   }
