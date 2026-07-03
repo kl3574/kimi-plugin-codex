@@ -22,7 +22,7 @@ Use this skill when the user wants a challenging, skeptical Codex review of thei
    - `node "$PLUGIN_ROOT/scripts/codex-review.mjs" adversarial-review`
    - `node "$PLUGIN_ROOT/scripts/codex-review.mjs" adversarial-review --base main`
    - `node "$PLUGIN_ROOT/scripts/codex-review.mjs" adversarial-review --focus "challenge error handling"`
-   - `node "$PLUGIN_ROOT/scripts/codex-review.mjs" adversarial-review --path src/utils.js challenge the null checks`
+   - `node "$PLUGIN_ROOT/scripts/codex-review.mjs" adversarial-review --path src/utils.js --focus "challenge the null checks"`
 3. Run the command and show the full output. Do not modify any files.
 4. Present the findings to the user, preserving severity headings.
 5. Do not apply any fixes unless the user explicitly asks in a separate step.

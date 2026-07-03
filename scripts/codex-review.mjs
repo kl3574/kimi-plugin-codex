@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const USAGE = `Usage: codex-review.mjs <setup|doctor|review|adversarial-review> [--base <ref>] [--focus <text>] [--path <file-or-dir>] [--probe-runtime]`;
@@ -13,7 +14,6 @@ const KILL_GRACE_MS = 10 * 1000;
 const CONNECT_TIMEOUT_MS = Number(process.env.CODEX_CONNECT_TIMEOUT_MS) || 5000;
 const MAX_UNTRACKED_BYTES = Number(process.env.CODEX_MAX_UNTRACKED_BYTES) || 500 * 1024;
 const TOTAL_UNTRACKED_BUDGET_BYTES = Number(process.env.CODEX_TOTAL_UNTRACKED_BUDGET_BYTES) || 1024 * 1024;
-const NULL_DEVICE = process.platform === 'win32' ? 'NUL' : '/dev/null';
 
 function runSync(cmd, args, opts = {}) {
   return spawnSync(cmd, args, {
@@ -33,6 +33,7 @@ function runWithStdin(cmd, args, stdin, opts = {}) {
     });
     let stdout = '';
     let stderr = '';
+    let combinedBytes = 0;
     let killed = false;
     let timedOut = false;
     let killReason = null;
@@ -50,8 +51,10 @@ function runWithStdin(cmd, args, stdin, opts = {}) {
         }, timeout)
       : null;
     child.stdout.on('data', (data) => {
+      if (resolved) return;
       stdout += data.toString();
-      if (Buffer.byteLength(stdout, 'utf8') > maxBuffer && !killed && !timedOut) {
+      combinedBytes += data.length;
+      if (combinedBytes > maxBuffer && !killed && !timedOut && !resolved) {
         killed = true;
         killReason = killReason || 'maxBuffer';
         child.kill('SIGTERM');
@@ -61,8 +64,10 @@ function runWithStdin(cmd, args, stdin, opts = {}) {
       }
     });
     child.stderr.on('data', (data) => {
+      if (resolved) return;
       stderr += data.toString();
-      if (Buffer.byteLength(stderr, 'utf8') > maxBuffer && !killed && !timedOut) {
+      combinedBytes += data.length;
+      if (combinedBytes > maxBuffer && !killed && !timedOut && !resolved) {
         killed = true;
         killReason = killReason || 'maxBuffer';
         child.kill('SIGTERM');
@@ -124,7 +129,11 @@ function getMergeBase(base, cwd) {
   if (result.status !== 0) {
     throw new Error(`git merge-base failed: ${result.stderr || result.error?.message || 'unknown error'}`);
   }
-  return result.stdout.trim();
+  const mergeBase = result.stdout.trim();
+  if (!mergeBase) {
+    throw new Error(`git merge-base ${base} HEAD returned empty result; the refs may not share a common ancestor.`);
+  }
+  return mergeBase;
 }
 
 
@@ -163,11 +172,37 @@ function validatePathValue(rawPath) {
   }
 }
 
+function isTrackedPath(cwd, relPath) {
+  const posixRel = relPath.replace(/\\/g, '/');
+  if (runSync('git', ['cat-file', '-e', `HEAD:${posixRel}`], { cwd }).status === 0) return true;
+  const lsResult = runSync('git', ['ls-files', '--error-unmatch', posixRel], { cwd });
+  return lsResult.status === 0;
+}
+
+function trackedObjectType(cwd, relPath) {
+  const posixRel = relPath.replace(/\\/g, '/');
+  const result = runSync('git', ['cat-file', '-t', `HEAD:${posixRel}`], { cwd });
+  if (result.status === 0) return result.stdout.trim();
+  const idxResult = runSync('git', ['ls-files', '--stage', posixRel], { cwd });
+  if (idxResult.status === 0) {
+    const mode = idxResult.stdout.trim().split(/\s+/)[0];
+    if (mode === '160000') return 'submodule';
+    if (mode === '120000') return 'symlink';
+    if (mode === '040000') return 'tree';
+    return 'blob';
+  }
+  return 'blob';
+}
+
 function resolveTargetPath(rawPath) {
   if (!rawPath) return null;
-  const absPath = path.resolve(rawPath);
+
+  const cwdRoot = findGitRoot();
+  const absPath = path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(rawPath);
+
   let stat;
   let targetType = 'file';
+  let deleted = false;
   try {
     stat = fs.lstatSync(absPath);
     if (stat.isSymbolicLink()) {
@@ -179,26 +214,39 @@ function resolveTargetPath(rawPath) {
     targetType = stat.isDirectory() ? 'dir' : 'file';
   } catch (err) {
     if (err && err.code === 'ENOENT') {
-      const parent = path.dirname(absPath);
-      if (!fs.existsSync(parent)) {
-        throw new Error(`Cannot access --path ${absPath}: ${err.message}`);
+      const searchRoot = path.dirname(absPath);
+      const gitRoot = findGitRoot(searchRoot);
+      if (gitRoot) {
+        const relPath = path.relative(gitRoot, absPath);
+        if (
+          relPath !== '..'
+          && !relPath.startsWith('..' + path.sep)
+          && !path.isAbsolute(relPath)
+          && isTrackedPath(gitRoot, relPath)
+        ) {
+          deleted = true;
+          targetType = trackedObjectType(gitRoot, relPath) === 'tree' ? 'dir' : 'file';
+        } else {
+          throw new Error(`--path does not exist: ${absPath}`);
+        }
+      } else {
+        throw new Error(`--path does not exist: ${absPath}`);
       }
-      targetType = rawPath.endsWith(path.sep) || rawPath.endsWith('/') ? 'dir' : 'file';
     } else {
       throw err;
     }
   }
+
   const searchRoot = stat && stat.isDirectory() ? absPath : path.dirname(absPath);
   const gitRoot = findGitRoot(searchRoot);
   if (!gitRoot) {
     throw new Error(`The path ${absPath} is not inside a git repository.`);
   }
-  const cwdRoot = findGitRoot();
   if (cwdRoot && gitRoot !== cwdRoot) {
     throw new Error(`The path ${absPath} is not inside the current git repository (${cwdRoot}).`);
   }
   const relPath = path.relative(gitRoot, absPath);
-  if (relPath.startsWith('..')) {
+  if (relPath === '..' || relPath.startsWith('..' + path.sep) || path.isAbsolute(relPath)) {
     throw new Error(`The path ${absPath} is outside the git repository (${gitRoot}).`);
   }
   return {
@@ -206,6 +254,7 @@ function resolveTargetPath(rawPath) {
     gitRoot,
     relPath: relPath || '.',
     targetType,
+    deleted,
   };
 }
 
@@ -230,19 +279,54 @@ function getUntrackedFiles(cwd) {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function getUntrackedFileDiff(cwd, file) {
-  const result = runSync('git', ['diff', '--no-index', '--', NULL_DEVICE, file], {
-    cwd,
-    maxBuffer: Math.max(2 * MAX_UNTRACKED_BYTES, 2 * 1024 * 1024),
-  });
-  const out = result.stdout;
-  if (/^Binary files .* differ$/m.test(out)) {
+function isBinaryContent(buf) {
+  if (buf.length === 0) return false;
+  if (buf.includes(0)) return true;
+  const sample = buf.subarray(0, Math.min(buf.length, 8192));
+  let nonPrintable = 0;
+  for (let i = 0; i < sample.length; i += 1) {
+    const b = sample[i];
+    if (b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b <= 0x7e)) continue;
+    nonPrintable += 1;
+  }
+  return nonPrintable / sample.length > 0.1;
+}
+
+function gitBlobHash(content) {
+  const header = `blob ${content.length}\0`;
+  return crypto.createHash('sha1').update(header).update(content).digest('hex').slice(0, 7);
+}
+
+function syntheticNewFileDiff(filePath, relPath) {
+  const content = fs.readFileSync(filePath);
+  if (isBinaryContent(content)) {
     return { skipped: true, reason: 'binary file' };
   }
-  if (!out.startsWith('diff --git')) {
-    return { skipped: true, reason: 'git diff failed' };
+  if (content.length === 0) {
+    return { skipped: true, reason: 'empty file' };
   }
-  return { diff: out };
+  const text = content.toString('utf8').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = text.split('\n');
+  const endsWithNewline = text.endsWith('\n');
+  const lineCount = endsWithNewline ? lines.length - 1 : lines.length;
+  const hash = gitBlobHash(content);
+  const header = [
+    `diff --git a/${relPath} b/${relPath}`,
+    'new file mode 100644',
+    `index 0000000..${hash}`,
+    '--- /dev/null',
+    `+++ b/${relPath}`,
+    `@@ -0,0 +1,${lineCount} @@`,
+  ];
+  const body = lines.slice(0, lineCount).map((line) => `+${line}`);
+  if (!endsWithNewline) {
+    body.push('\\ No newline at end of file');
+  }
+  return { diff: header.concat(body).join('\n') };
+}
+
+function getUntrackedFileDiff(cwd, file) {
+  return syntheticNewFileDiff(path.resolve(cwd, file), file);
 }
 
 function formatUntrackedDiff(cwd, target = null) {
@@ -256,7 +340,7 @@ function formatUntrackedDiff(cwd, target = null) {
       files = files.filter((f) => f.startsWith(prefix));
     }
   }
-  if (files.length === 0) return '';
+  if (files.length === 0) return { diff: '', hasRealDiff: false, skipped: [] };
   const parts = [];
   const skipped = [];
   let totalBytes = 0;
@@ -305,20 +389,23 @@ function formatUntrackedDiff(cwd, target = null) {
     totalBytes += diffBytes;
     parts.push(result.diff);
   }
-  if (skipped.length) {
-    parts.push(`\n# Skipped untracked files: ${skipped.join(', ')}`);
-  }
-  return parts.join('\n');
+  const diff = parts.length > 0 && skipped.length > 0
+    ? [...parts, `\n# Skipped untracked files: ${skipped.join(', ')}`].join('\n')
+    : parts.join('\n');
+  return { diff, hasRealDiff: parts.length > 0, skipped };
 }
 
 function buildReviewDiff(base, cwd, target = null) {
   const trackedDiff = getDiff(base, cwd, target);
   if (base) {
-    return trackedDiff;
+    return { diff: trackedDiff, hasRealDiff: trackedDiff.trim().length > 0, skipped: [] };
   }
-  const untrackedDiff = formatUntrackedDiff(cwd, target);
-  if (!untrackedDiff) return trackedDiff;
-  return [trackedDiff, untrackedDiff].filter(Boolean).join('\n');
+  const untracked = formatUntrackedDiff(cwd, target);
+  return {
+    diff: [trackedDiff, untracked.diff].filter(Boolean).join('\n'),
+    hasRealDiff: trackedDiff.trim().length > 0 || untracked.hasRealDiff,
+    skipped: untracked.skipped,
+  };
 }
 
 function splitArgsString(s) {
@@ -419,7 +506,7 @@ function codexAuthOk() {
   const result = runSync('codex', ['login', 'status'], { timeout: PROBE_TIMEOUT_MS });
   if (result.status !== 0) return false;
   const output = (result.stdout || '') + (result.stderr || '');
-  return /\bLogged in\b/.test(output);
+  return /\bLogged\s+in\b/i.test(output);
 }
 
 function setup() {
@@ -444,7 +531,7 @@ function pluginRoot() {
 
 function isWritableDir(dir) {
   try {
-    if (!fs.existsSync(dir)) return false;
+    fs.accessSync(dir, fs.constants.F_OK);
     fs.accessSync(dir, fs.constants.W_OK);
     return true;
   } catch {
@@ -475,7 +562,10 @@ function checkProxy() {
     const urlString = /^https?:\/\//i.test(proxy) ? proxy : `http://${proxy}`;
     const u = new URL(urlString);
     host = u.hostname;
-    port = u.port || (u.protocol === 'https:' ? 443 : 80);
+    port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
+      return { ok: false, detail: `Proxy URL has invalid port: ${u.port || '(default)'}` };
+    }
   } catch (err) {
     return { ok: false, detail: `Proxy URL parse failed: ${err.message}` };
   }
@@ -498,16 +588,31 @@ async function probeCodex() {
     return { ok: false, detail: (result.stderr || '').trim() || `exit ${result.code}` };
   }
   const first = result.stdout.trim().split('\n')[0];
+  if (first !== 'RUNTIME-OK') {
+    return { ok: false, detail: `unexpected output: "${first}"` };
+  }
   return { ok: true, detail: `returned "${first}"` };
 }
 
-async function doctor({ probeRuntime, unknown = [], positional = [] }) {
+async function doctor({ probeRuntime, base, focus, path: pathOption, unknown = [], positional = [] }) {
   if (unknown.length) {
     console.error(`❌ Unknown option(s): ${unknown.join(', ')}`);
     process.exit(1);
   }
   if (positional.length) {
     console.error(`❌ Unexpected positional argument(s): ${positional.join(' ')}`);
+    process.exit(1);
+  }
+  if (base !== undefined && base !== null) {
+    console.error('❌ --base is not valid for the doctor command.');
+    process.exit(1);
+  }
+  if (focus) {
+    console.error('❌ --focus is not valid for the doctor command.');
+    process.exit(1);
+  }
+  if (pathOption) {
+    console.error('❌ --path is not valid for the doctor command.');
     process.exit(1);
   }
   const issues = [];
@@ -530,7 +635,9 @@ async function doctor({ probeRuntime, unknown = [], positional = [] }) {
     report(false, 'Current directory is not inside a git repository');
   }
   report(isWritableDir(os.tmpdir()), 'Temp directory is writable', os.tmpdir());
-  report(isWritableDir(pluginRoot()), 'Plugin root is writable', pluginRoot());
+  const root = pluginRoot();
+  const rootWritable = isWritableDir(root);
+  console.log(`${rootWritable ? '[OK]' : '[INFO]'} Plugin root is writable - ${root}${rootWritable ? '' : ' (read-only is OK for managed installs)'}`);
   const kimiHome = process.env.KIMI_CODE_HOME || path.join(os.homedir(), '.kimi-code');
   report(isWritableDir(kimiHome), 'Kimi Code home is writable', kimiHome);
 
@@ -571,9 +678,13 @@ async function doctor({ probeRuntime, unknown = [], positional = [] }) {
 
 // -------------------- review --------------------
 
-async function review({ base, focus, path: rawPath, adversarial = false, unknown = [], positional = [] }) {
+async function review({ base, focus, path: rawPath, probeRuntime, adversarial = false, unknown = [], positional = [] }) {
   if (unknown.length) {
     console.error(`❌ Unknown option(s): ${unknown.join(', ')}`);
+    process.exit(1);
+  }
+  if (probeRuntime) {
+    console.error('❌ --probe-runtime is only valid for the doctor command.');
     process.exit(1);
   }
 
@@ -627,17 +738,29 @@ async function review({ base, focus, path: rawPath, adversarial = false, unknown
     }
   }
 
-  let diff;
+  let diffResult;
   try {
-    diff = buildReviewDiff(base, gitRoot, target);
+    diffResult = buildReviewDiff(base, gitRoot, target);
   } catch (err) {
     console.error(`❌ ${err.message}`);
     process.exit(1);
   }
 
-  if (!diff.trim()) {
+  if (diffResult.skipped.length) {
+    console.warn(`⚠️ Skipped untracked files: ${diffResult.skipped.join(', ')}`);
+  }
+  if (!diffResult.hasRealDiff) {
     console.log('No changes to review.');
     return;
+  }
+  let diff = diffResult.diff;
+
+  const maxDiffChars = 120000;
+  const codePoints = [...diff];
+  let truncated = false;
+  if (codePoints.length > maxDiffChars) {
+    diff = codePoints.slice(0, maxDiffChars).join('') + '\n\n[diff truncated]';
+    truncated = true;
   }
 
   const displayBase = sanitizePromptInput(base);
@@ -689,6 +812,9 @@ async function review({ base, focus, path: rawPath, adversarial = false, unknown
   }
 
   console.log('## Codex CLI review output\n');
+  if (truncated) {
+    console.log('⚠️ Diff was truncated before sending to Codex.\n');
+  }
   console.log(result.stdout);
 }
 

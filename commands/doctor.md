@@ -14,5 +14,5 @@ if [ ! -f "$SCRIPT" ]; then
   echo "❌ Plugin script not found at $SCRIPT. Is kimi-plugin-codex installed?" >&2
   exit 1
 fi
-node "$SCRIPT" doctor "$ARGUMENTS"
+REVIEW_ARGS="$ARGUMENTS" node "$SCRIPT" doctor
 ```
