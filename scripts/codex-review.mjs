@@ -376,6 +376,9 @@ function formatUntrackedDiff(cwd, target = null) {
       continue;
     }
     let result;
+    // Safety net: getUntrackedFileDiff delegates to syntheticNewFileDiff, which
+    // handles read errors and returns { skipped }. This catch guards against
+    // unexpected errors in diff construction.
     try {
       result = getUntrackedFileDiff(cwd, file);
     } catch (err) {
