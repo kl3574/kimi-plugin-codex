@@ -16,32 +16,46 @@ function runSync(cmd, args, opts = {}) {
 }
 
 function runWithStdin(cmd, args, stdin, opts = {}) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const { timeout = 5 * 60 * 1000, maxBuffer = DIFF_MAX_BUFFER, ...spawnOpts } = opts;
     const child = spawn(cmd, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      timeout,
       ...spawnOpts,
     });
     let stdout = '';
     let stderr = '';
     let killed = false;
+    let timedOut = false;
+    const timer = timeout
+      ? setTimeout(() => {
+          timedOut = true;
+          child.kill('SIGTERM');
+        }, timeout)
+      : null;
     child.stdout.on('data', (data) => {
       stdout += data.toString();
-      if (Buffer.byteLength(stdout, 'utf8') > maxBuffer && !killed) {
+      if (Buffer.byteLength(stdout, 'utf8') > maxBuffer && !killed && !timedOut) {
         killed = true;
         child.kill('SIGTERM');
       }
     });
     child.stderr.on('data', (data) => {
       stderr += data.toString();
-      if (Buffer.byteLength(stderr, 'utf8') > maxBuffer && !killed) {
+      if (Buffer.byteLength(stderr, 'utf8') > maxBuffer && !killed && !timedOut) {
         killed = true;
         child.kill('SIGTERM');
       }
     });
-    child.on('error', reject);
+    child.on('error', (err) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code: 1, stdout, stderr: `❌ Failed to start ${cmd}: ${err.message}` });
+    });
     child.on('close', (code, signal) => {
+      if (timer) clearTimeout(timer);
+      if (timedOut) {
+        resolve({ code: 1, stdout, stderr: stderr + '\n❌ Review timed out after 5 minutes.' });
+        return;
+      }
       if (signal === 'SIGTERM' && killed) {
         resolve({ code: 1, stdout, stderr: stderr + '\n❌ Output exceeded maxBuffer limit.' });
         return;
@@ -69,13 +83,13 @@ function gitStatusPorcelain(cwd) {
 
 function hasChanges(base, cwd) {
   if (base) {
-    const branchResult = runSync('git', ['diff', '--quiet', `${base}..HEAD`], { cwd });
-    if (branchResult.status === 0) {
-      // Branch diff is empty; also check working tree so local edits are not ignored.
-      return gitStatusPorcelain(cwd).trim().length > 0;
+    const result = runSync('git', ['diff', '--quiet', base, '--'], { cwd });
+    if (result.status === 0) {
+      // No tracked changes since base; still consider untracked files as changes.
+      return getUntrackedFiles(cwd).length > 0;
     }
-    if (branchResult.status === 1) return true;
-    throw new Error(`git diff failed: ${branchResult.stderr || branchResult.error?.message || 'unknown error'}`);
+    if (result.status === 1) return true;
+    throw new Error(`git diff failed: ${result.stderr || result.error?.message || 'unknown error'}`);
   }
   return gitStatusPorcelain(cwd).trim().length > 0;
 }
@@ -86,9 +100,25 @@ function checkGitDiff(result, label) {
   }
 }
 
+function sanitizePromptInput(s) {
+  return String(s || '').replace(/[\n\r]/g, ' ').replace(/```/g, "'''").trim();
+}
+
+function validateBaseRef(base) {
+  if (base === undefined || base === null) return;
+  if (base.trim() === '') {
+    throw new Error('--base requires a non-empty ref');
+  }
+  if (base.startsWith('-')) {
+    throw new Error('--base value cannot start with "-"');
+  }
+}
+
 function getDiff(base, cwd) {
   if (base) {
-    const result = runSync('git', ['diff', '--no-color', `${base}..HEAD`], { cwd, maxBuffer: DIFF_MAX_BUFFER });
+    // Compare the base ref directly to the working tree so the review covers
+    // both committed branch changes and local edits, without duplication.
+    const result = runSync('git', ['diff', '--no-color', base, '--'], { cwd, maxBuffer: DIFF_MAX_BUFFER });
     checkGitDiff(result, 'base');
     return result.stdout;
   }
@@ -156,16 +186,6 @@ function formatUntrackedDiff(cwd) {
 
 function buildReviewDiff(base, cwd) {
   const trackedDiff = getDiff(base, cwd);
-  if (base) {
-    // When comparing to a base ref, also include working-tree changes so the
-    // review covers the user's current state, not just committed branch diffs.
-    const unstaged = runSync('git', ['diff', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER });
-    checkGitDiff(unstaged, 'unstaged');
-    const staged = runSync('git', ['diff', '--cached', '--no-color'], { cwd, maxBuffer: DIFF_MAX_BUFFER });
-    checkGitDiff(staged, 'staged');
-    const workingDiff = [staged.stdout, unstaged.stdout].filter(Boolean).join('\n');
-    return [trackedDiff, workingDiff].filter(Boolean).join('\n');
-  }
   const untrackedDiff = formatUntrackedDiff(cwd);
   if (!untrackedDiff) {
     return trackedDiff;
@@ -197,8 +217,24 @@ function splitArgsString(s) {
 }
 
 function normalizeArgv(argv) {
-  const raw = argv.slice(2).join(' ');
-  return raw.length > 0 ? splitArgsString(raw) : [];
+  // When invoked from the Kimi Code command wrapper, arguments arrive as a
+  // single quoted string in REVIEW_ARGS (avoids shell interpolation of user
+  // input). The subcommand (review/adversarial-review/setup) is still passed
+  // as argv[2], so we prepend it to any env-var flags.
+  const envArgs = process.env.REVIEW_ARGS;
+  const args = argv.slice(2).filter((a) => a.length > 0);
+  let tokens = [];
+  if (envArgs !== undefined) {
+    tokens = envArgs.length > 0 ? splitArgsString(envArgs) : [];
+  } else if (args.length === 1 && /\s/.test(args[0])) {
+    tokens = splitArgsString(args[0]);
+  } else {
+    tokens = args;
+  }
+  if (args.length > 0 && args[0] !== tokens[0]) {
+    tokens = [args[0], ...tokens];
+  }
+  return tokens;
 }
 
 function parseArgs(argv) {
@@ -271,7 +307,11 @@ async function review({ base, focus, adversarial = false, unknown = [], position
   }
 
   let effectiveFocus = focus;
-  if (adversarial && !effectiveFocus && positional.length) {
+  if (adversarial && positional.length) {
+    if (effectiveFocus) {
+      console.error('❌ Cannot use positional focus text together with --focus.');
+      process.exit(1);
+    }
     effectiveFocus = positional.join(' ');
   } else if (positional.length) {
     console.error(`❌ Unexpected positional argument(s): ${positional.join(' ')}`);
@@ -286,6 +326,17 @@ async function review({ base, focus, adversarial = false, unknown = [], position
 
   if (!codexOnPath()) {
     console.error('❌ Codex CLI not found on PATH. Run `/kimi-plugin-codex:setup` first.');
+    process.exit(1);
+  }
+  if (!codexAuthOk()) {
+    console.error('❌ Codex CLI is not authenticated. Run `/kimi-plugin-codex:setup` first.');
+    process.exit(1);
+  }
+
+  try {
+    validateBaseRef(base);
+  } catch (err) {
+    console.error(`❌ ${err.message}`);
     process.exit(1);
   }
 
@@ -312,7 +363,9 @@ async function review({ base, focus, adversarial = false, unknown = [], position
     return;
   }
 
-  let result;
+  const displayBase = sanitizePromptInput(base);
+  const displayFocus = sanitizePromptInput(effectiveFocus);
+
   const promptLines = [
     'You are a senior staff engineer doing a read-only code review.',
     'Review the git diff provided on stdin. Do not modify any files.',
@@ -320,17 +373,20 @@ async function review({ base, focus, adversarial = false, unknown = [], position
   if (adversarial) {
     promptLines.push('Challenge design decisions, trade-offs, hidden assumptions, and failure modes. Be constructive but skeptical.');
   }
-  if (effectiveFocus) {
-    promptLines.push(`Focus: ${effectiveFocus}`);
+  if (displayFocus) {
+    promptLines.push(`Focus: ${displayFocus}`);
   }
   promptLines.push(
     'Categorize findings as Critical, Important, or Minor.',
     'For each finding include severity, file:line, evidence, why it matters, and a recommended fix.',
     'End with an overall verdict.',
   );
+  if (base) {
+    promptLines.push('', `Base ref: ${displayBase}`);
+  }
   const prompt = promptLines.join('\n');
 
-  result = await runWithStdin('codex', [
+  const result = await runWithStdin('codex', [
     'exec',
     '-s', 'read-only',
     '--ignore-user-config',
@@ -347,7 +403,15 @@ async function review({ base, focus, adversarial = false, unknown = [], position
   console.log(result.stdout);
 }
 
-const { command, options } = parseArgs(process.argv);
+let command;
+let options;
+try {
+  ({ command, options } = parseArgs(process.argv));
+} catch (err) {
+  console.error(`❌ ${err.message}`);
+  console.error(USAGE);
+  process.exit(1);
+}
 
 async function main() {
   switch (command) {

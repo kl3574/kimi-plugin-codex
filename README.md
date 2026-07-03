@@ -57,7 +57,7 @@ The plugin builds a git diff (staged + unstaged + untracked files, or against a 
 
 - Requires a local git repository.
 - Requires `codex` on PATH and authenticated.
-- `--focus` is supported in normal review mode by appending it to the review prompt.
+- `--focus` is supported in both normal and adversarial review modes by appending it to the review prompt.
 - Unlike `codex-plugin-cc`, this v0.1 prototype does **not** implement:
   - `--background` / `--wait` execution modes
   - `--scope auto|working-tree|branch` target selection
