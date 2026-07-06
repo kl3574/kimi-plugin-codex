@@ -11,13 +11,21 @@ From GitHub (recommended):
 /reload
 ```
 
-Or clone manually into your Kimi Code plugins directory:
+Or clone manually into your Kimi Code plugins directory (replace `~/.kimi-code` with your `$KIMI_CODE_HOME` if you changed it):
 
 ```bash
 git clone https://github.com/kl3574/kimi-plugin-codex.git ~/.kimi-code/plugins/managed/kimi-plugin-codex
 ```
 
 Then restart Kimi Code or run `/reload`.
+
+### Custom Codex CLI location
+
+If your Codex CLI binary is not named `codex` on PATH, set `CC_CODEX_BIN`:
+
+```bash
+export CC_CODEX_BIN=/path/to/codex
+```
 
 ## Usage
 

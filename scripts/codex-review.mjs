@@ -14,6 +14,7 @@ const KILL_GRACE_MS = 10 * 1000;
 const CONNECT_TIMEOUT_MS = Number(process.env.CODEX_CONNECT_TIMEOUT_MS) || 5000;
 const MAX_UNTRACKED_BYTES = Number(process.env.CODEX_MAX_UNTRACKED_BYTES) || 500 * 1024;
 const TOTAL_UNTRACKED_BUDGET_BYTES = Number(process.env.CODEX_TOTAL_UNTRACKED_BUDGET_BYTES) || 1024 * 1024;
+const CODEX_BIN = process.env.CC_CODEX_BIN || 'codex';
 
 function runSync(cmd, args, opts = {}) {
   return spawnSync(cmd, args, {
@@ -500,18 +501,18 @@ function parseArgs(argv) {
 }
 
 function codexOnPath() {
-  const result = runSync('codex', ['--version'], { timeout: PROBE_TIMEOUT_MS });
+  const result = runSync(CODEX_BIN, ['--version'], { timeout: PROBE_TIMEOUT_MS });
   return result.status === 0;
 }
 
 function codexVersion() {
-  const result = runSync('codex', ['--version'], { timeout: PROBE_TIMEOUT_MS });
+  const result = runSync(CODEX_BIN, ['--version'], { timeout: PROBE_TIMEOUT_MS });
   if (result.status !== 0) return null;
   return result.stdout.trim();
 }
 
 function codexAuthOk() {
-  const result = runSync('codex', ['login', 'status'], { timeout: PROBE_TIMEOUT_MS });
+  const result = runSync(CODEX_BIN, ['login', 'status'], { timeout: PROBE_TIMEOUT_MS });
   if (result.status !== 0) return false;
   const output = (result.stdout || '') + (result.stderr || '');
   return /\bLogged\s+in\b/i.test(output);
@@ -585,7 +586,7 @@ function checkProxy() {
 }
 
 async function probeCodex() {
-  const result = await runWithStdin('codex', [
+  const result = await runWithStdin(CODEX_BIN, [
     'exec',
     '-s', 'read-only',
     '--ignore-user-config',
@@ -794,7 +795,7 @@ async function review({ base, focus, path: rawPath, probeRuntime, adversarial = 
   }
   const prompt = promptLines.join('\n');
 
-  const result = await runWithStdin('codex', [
+  const result = await runWithStdin(CODEX_BIN, [
     'exec',
     '-s', 'read-only',
     '--ignore-user-config',
@@ -858,5 +859,6 @@ async function main() {
 
 main().catch((err) => {
   console.error('❌ Unexpected error:', err.message);
+  if (err.stack) console.error(err.stack);
   process.exit(1);
 });
